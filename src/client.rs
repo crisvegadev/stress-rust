@@ -54,6 +54,48 @@ pub async fn connect(url: &str, metrics: &Arc<Metrics>) -> Result<WsClient, Stri
     }
 }
 
+/// Perform Engine.IO + Socket.IO handshake:
+/// 1. Receive OPEN packet (0{...})
+/// 2. Send CONNECT (40)
+/// 3. Receive CONNECT ACK (40{...})
+pub async fn handshake(
+    sink: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    stream: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) -> Result<(), String> {
+    // Wait for Engine.IO OPEN packet (0{...})
+    let open_timeout = timeout(Duration::from_secs(5), stream.next()).await;
+    match open_timeout {
+        Ok(Some(Ok(Message::Text(t)))) if t.starts_with('0') => {
+            // Got OPEN packet, good
+        }
+        _ => return Err("No Engine.IO OPEN packet received".to_string()),
+    }
+
+    // Send Socket.IO CONNECT (40)
+    sink.send(Message::Text("40".to_string()))
+        .await
+        .map_err(|e| format!("Failed to send CONNECT: {e}"))?;
+
+    // Wait for CONNECT ACK (40{...})
+    let ack_timeout = timeout(Duration::from_secs(5), stream.next()).await;
+    match ack_timeout {
+        Ok(Some(Ok(Message::Text(t)))) if t.starts_with("40") => {
+            // Connected to namespace
+            Ok(())
+        }
+        _ => Err("No Socket.IO CONNECT ACK received".to_string()),
+    }
+}
+
 pub async fn subscribe(
     sink: &mut futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<

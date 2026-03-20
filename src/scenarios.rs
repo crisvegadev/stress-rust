@@ -24,6 +24,11 @@ pub async fn run_device(
     };
     let (mut sink, mut stream) = (ws.sink, ws.stream);
 
+    // Engine.IO + Socket.IO handshake
+    if client::handshake(&mut sink, &mut stream).await.is_err() {
+        return;
+    }
+
     // Devices only subscribe to their group room (if any), NOT to userLocation.
     // In production, devices send location but only the map listens.
     if let Some(g) = group {
@@ -37,12 +42,17 @@ pub async fn run_device(
     let metrics_recv = metrics.clone();
 
     // Receiver task — only listens for group broadcasts (coach commands)
+    // Also handles Engine.IO pings
     let recv_handle = tokio::spawn(async move {
         while Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
                 Ok(Some(Ok(Message::Text(txt)))) => {
+                    // Engine.IO ping/pong
+                    if txt == "2" || txt == "3" { continue; }
+                    if !txt.starts_with("42") { continue; }
+
                     // Parse Socket.IO format: 42["event", {data}]
-                    let json_str = if let Some(stripped) = txt.strip_prefix("42") { stripped } else { &txt[..] };
+                    let json_str = &txt[2..];
                     if let Ok(arr) = serde_json::from_str::<serde_json::Value>(json_str) {
                         if let Some(arr) = arr.as_array() {
                             let event_type = arr.first().and_then(|v| v.as_str()).unwrap_or("");
@@ -126,6 +136,10 @@ pub async fn run_map_client(url: String, duration: Duration, metrics: Arc<Metric
     };
     let (mut sink, mut stream) = (ws.sink, ws.stream);
 
+    if client::handshake(&mut sink, &mut stream).await.is_err() {
+        return;
+    }
+
     if client::subscribe(&mut sink, "roomMap").await.is_err() {
         return;
     }
@@ -135,12 +149,21 @@ pub async fn run_map_client(url: String, duration: Duration, metrics: Arc<Metric
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
             Ok(Some(Ok(Message::Text(txt)))) => {
+                // Engine.IO ping — respond with pong
+                if txt == "2" {
+                    let _ = sink.send(Message::Text("3".to_string())).await;
+                    continue;
+                }
+                // Engine.IO pong — ignore
+                if txt == "3" { continue; }
+                // Skip non-42 messages
+                if !txt.starts_with("42") { continue; }
+
                 metrics
                     .location_messages_received
                     .fetch_add(1, Ordering::Relaxed);
 
-                // Parse Socket.IO format: 42["event", {data}]
-                let json_str = if let Some(stripped) = txt.strip_prefix("42") { stripped } else { &txt[..] };
+                let json_str = &txt[2..];
                 if let Ok(arr) = serde_json::from_str::<serde_json::Value>(json_str) {
                     if let Some(arr) = arr.as_array() {
                         let data = arr.get(1).unwrap_or(&serde_json::Value::Null);
@@ -171,7 +194,11 @@ pub async fn run_coach(
         Ok(c) => c,
         Err(_) => return,
     };
-    let (mut sink, _stream) = (ws.sink, ws.stream);
+    let (mut sink, mut stream) = (ws.sink, ws.stream);
+
+    if client::handshake(&mut sink, &mut stream).await.is_err() {
+        return;
+    }
 
     let room = format!("group-{group_id}");
     if client::subscribe(&mut sink, &room).await.is_err() {
