@@ -108,16 +108,63 @@ pub async fn run_device(
         }
     });
 
-    // Sender loop — random positions across the Americas (Alaska to Patagonia)
-    // Lat: -55 (Tierra del Fuego) to 71 (Alaska)
-    // Lng: -170 (Alaska west) to -34 (Brazil east)
+    // Sender loop — random positions across Mexico
+    // Lat: 14.5 (Chiapas) to 32.7 (Tijuana)
+    // Lng: -117.1 (Tijuana) to -86.7 (Cancún)
     let base_lat: f64 = {
         let mut rng = rand::thread_rng();
-        rng.gen_range(-55.0..71.0)
+        // Weighted toward major cities
+        let cities: &[(f64, f64)] = &[
+            (19.4326, -99.1332),   // CDMX
+            (20.6597, -103.3496),  // Guadalajara
+            (25.6866, -100.3161),  // Monterrey
+            (21.1619, -86.8515),   // Cancún
+            (20.9674, -89.5926),   // Mérida
+            (19.1738, -96.1342),   // Veracruz
+            (32.5149, -117.0382),  // Tijuana
+            (20.5888, -100.3899),  // Querétaro
+            (21.8818, -102.2916),  // Aguascalientes
+            (22.1565, -100.9855),  // San Luis Potosí
+            (28.6353, -106.0889),  // Chihuahua
+            (24.0277, -104.6532),  // Durango
+            (17.0732, -96.7266),   // Oaxaca
+            (16.7370, -93.1296),   // Tuxtla Gutiérrez
+            (19.0414, -98.2063),   // Puebla
+            (21.0190, -101.2574),  // León
+            (20.1011, -98.7591),   // Pachuca
+            (18.9242, -99.2216),   // Cuernavaca
+            (23.6345, -102.5528),  // Zacatecas
+            (31.6904, -106.4245),  // Ciudad Juárez
+        ];
+        let city = cities[device_id % cities.len()];
+        city.0 + rng.gen_range(-0.05..0.05)
     };
     let base_lng: f64 = {
         let mut rng = rand::thread_rng();
-        rng.gen_range(-170.0..-34.0)
+        let cities: &[(f64, f64)] = &[
+            (19.4326, -99.1332),
+            (20.6597, -103.3496),
+            (25.6866, -100.3161),
+            (21.1619, -86.8515),
+            (20.9674, -89.5926),
+            (19.1738, -96.1342),
+            (32.5149, -117.0382),
+            (20.5888, -100.3899),
+            (21.8818, -102.2916),
+            (22.1565, -100.9855),
+            (28.6353, -106.0889),
+            (24.0277, -104.6532),
+            (17.0732, -96.7266),
+            (16.7370, -93.1296),
+            (19.0414, -98.2063),
+            (21.0190, -101.2574),
+            (20.1011, -98.7591),
+            (18.9242, -99.2216),
+            (23.6345, -102.5528),
+            (31.6904, -106.4245),
+        ];
+        let city = cities[device_id % cities.len()];
+        city.1 + rng.gen_range(-0.05..0.05)
     };
 
     while Instant::now() < deadline {
