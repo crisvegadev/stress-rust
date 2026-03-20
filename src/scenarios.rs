@@ -9,6 +9,40 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::client;
 use crate::metrics::Metrics;
 
+const CAMPUSES: &[&str] = &[
+    "Colegio Colón de Ocotlán",
+    "Colegio Lomas del Valle (Campus Acueducto)",
+    "Instituto Cumbres Villahermosa",
+    "Colegio Miraflores Guadalajara",
+    "Instituto Alpes San Javier",
+    "Colegio Británico de Monterrey",
+    "Liceo Europeo de México",
+    "Colegio Williams Campus Mixcoac",
+    "Instituto Thomas Jefferson CDMX",
+    "Colegio Americano de Puebla",
+    "Instituto Irlandés Monterrey",
+    "Colegio Suizo de México",
+    "Academia Juárez de Chihuahua",
+    "Colegio Cervantes Primavera GDL",
+    "Instituto Oriente de Puebla",
+    "Colegio La Salle Cancún",
+    "Instituto Cumbres Oaxaca",
+    "Colegio Marista Mérida",
+    "Liceo Anglo Francés de Tijuana",
+    "Colegio del Bosque Querétaro",
+    "Instituto Bilingüe Canadiense León",
+    "Colegio Americano de Bogotá",
+    "Liceo Francés de Buenos Aires",
+    "Instituto Cervantes São Paulo",
+    "Colegio Lincoln Santiago Chile",
+];
+
+const USER_TYPES: &[&str] = &[
+    "Student", "Student", "Student", "Student", "Student",
+    "Student", "Student", "Student", "Student", "Student",
+    "Coach", "Coordinator", "Parent",
+];
+
 /// Device client: subscribes to userLocation (and optionally a group), sends location pings.
 pub async fn run_device(
     url: String,
@@ -74,9 +108,17 @@ pub async fn run_device(
         }
     });
 
-    // Sender loop
-    let base_lat = 19.4326 + (device_id as f64 * 0.0001) % 0.5;
-    let base_lng = -99.1332 + (device_id as f64 * 0.00007) % 0.5;
+    // Sender loop — random positions across the Americas (Alaska to Patagonia)
+    // Lat: -55 (Tierra del Fuego) to 71 (Alaska)
+    // Lng: -170 (Alaska west) to -34 (Brazil east)
+    let base_lat: f64 = {
+        let mut rng = rand::thread_rng();
+        rng.gen_range(-55.0..71.0)
+    };
+    let base_lng: f64 = {
+        let mut rng = rand::thread_rng();
+        rng.gen_range(-170.0..-34.0)
+    };
 
     while Instant::now() < deadline {
         let (interval, lat, lng) = {
@@ -104,8 +146,8 @@ pub async fn run_device(
                     "latitude": lat,
                     "longitude": lng,
                     "idUserInt": device_id,
-                    "campus": format!("Campus-{}", device_id % 100),
-                    "userType": "Student",
+                    "campus": CAMPUSES[device_id % CAMPUSES.len()],
+                    "userType": USER_TYPES[device_id % USER_TYPES.len()],
                     "sentAt": now_ms
                 }
             ])
