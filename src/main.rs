@@ -1,315 +1,183 @@
-use clap::Parser;
-use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering};
+mod client;
+mod metrics;
+mod report;
+mod scenarios;
+
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::time;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+use clap::Parser;
+use tokio::time::{Duration, Instant};
+
+use metrics::Metrics;
 
 #[derive(Parser)]
-#[command(name = "stress-ws", about = "WebSocket stress test")]
+#[command(name = "stress-ws", about = "Knotion WebSocket stress test")]
 struct Args {
     /// WebSocket server URL
     #[arg(short, long, default_value = "ws://localhost:3003/socket.io/")]
     url: String,
 
-    /// Number of concurrent clients
-    #[arg(short, long, default_value_t = 1000)]
-    clients: usize,
+    /// Number of device clients (send userLocation)
+    #[arg(short = 'd', long, default_value_t = 1000)]
+    devices: usize,
 
-    /// Total messages per second (distributed across random clients)
-    #[arg(short, long, default_value_t = 100)]
-    rate: u64,
+    /// Number of group rooms to simulate
+    #[arg(short = 'g', long, default_value_t = 20)]
+    groups: usize,
+
+    /// Devices per group
+    #[arg(long, default_value_t = 30)]
+    devices_per_group: usize,
+
+    /// Location ping interval in seconds per device
+    #[arg(short = 'i', long, default_value_t = 10)]
+    ping_interval: u64,
 
     /// Test duration in seconds
-    #[arg(short, long, default_value_t = 10)]
+    #[arg(short = 't', long, default_value_t = 60)]
     duration: u64,
 
-    /// Connection batch size
-    #[arg(short, long, default_value_t = 100)]
+    /// Connection batch size (concurrent connects)
+    #[arg(short, long, default_value_t = 200)]
     batch: usize,
+
+    /// Connection ramp-up delay between batches (ms)
+    #[arg(long, default_value_t = 100)]
+    ramp_delay_ms: u64,
+
+    /// Number of coach broadcast events per group per minute
+    #[arg(long, default_value_t = 2)]
+    coach_events_per_min: u64,
+
+    /// Output JSON report to file
+    #[arg(long)]
+    json_output: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    let metrics = Arc::new(Metrics::new());
+    let test_duration = Duration::from_secs(args.duration);
 
-    println!(
-        "\n\
-        ╔══════════════════════════════════════════════╗\n\
-        ║     WebSocket Stress Test (Rust)              ║\n\
-        ╠══════════════════════════════════════════════╣\n\
-        ║  Server:       {:<29}║\n\
-        ║  Clients:      {:<29}║\n\
-        ║  Total rate:   {:<29}║\n\
-        ║  Duration:     {:<29}║\n\
-        ╚══════════════════════════════════════════════╝\n",
-        args.url,
-        args.clients,
-        format!("{} msg/s (shared)", args.rate),
-        format!("{}s", args.duration),
-    );
+    // Total clients: 1 map + devices + groups (coaches)
+    let total_group_devices = (args.groups * args.devices_per_group).min(args.devices);
 
-    let total_sent = Arc::new(AtomicU64::new(0));
-    let total_received = Arc::new(AtomicU64::new(0));
-    let connect_errors = Arc::new(AtomicU64::new(0));
-    let send_errors = Arc::new(AtomicU64::new(0));
-    let latency_sum = Arc::new(AtomicU64::new(0));
-    let latency_count = Arc::new(AtomicU64::new(0));
+    eprintln!("🚀 Knotion WebSocket Stress Test");
+    eprintln!("   Server: {}", args.url);
+    eprintln!("   Devices: {}, Groups: {}, Devices/group: {}", args.devices, args.groups, args.devices_per_group);
+    eprintln!("   Duration: {}s, Ping interval: {}s", args.duration, args.ping_interval);
+    eprintln!();
 
-    // Collect per-client senders for broadcasting
-    type WsSender = futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        Message,
-    >;
-    let senders: Arc<tokio::sync::Mutex<Vec<WsSender>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let start = Instant::now();
 
-    // Connect clients in batches
-    println!("⏳ Connecting {} clients in batches of {}...", args.clients, args.batch);
-    let connect_start = Instant::now();
-    let mut receiver_handles = Vec::new();
+    // Spawn map client first
+    let map_url = args.url.clone();
+    let map_metrics = metrics.clone();
+    let map_handle = tokio::spawn(async move {
+        scenarios::run_map_client(map_url, test_duration, map_metrics).await;
+    });
 
-    for batch_start in (0..args.clients).step_by(args.batch) {
-        let batch_end = (batch_start + args.batch).min(args.clients);
-        let mut batch_futures = Vec::new();
+    // Small delay to let map client connect first
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-        for _id in batch_start..batch_end {
+    // Spawn coach clients
+    let mut coach_handles = Vec::new();
+    for g in 1..=args.groups {
+        let url = args.url.clone();
+        let m = metrics.clone();
+        let epm = args.coach_events_per_min;
+        coach_handles.push(tokio::spawn(async move {
+            scenarios::run_coach(url, g, epm, test_duration, m).await;
+        }));
+    }
+
+    // Spawn device clients in batches
+    let mut device_handles = Vec::new();
+    for batch_start in (0..args.devices).step_by(args.batch) {
+        let batch_end = (batch_start + args.batch).min(args.devices);
+        let mut batch_tasks = Vec::new();
+
+        for device_id in batch_start..batch_end {
             let url = args.url.clone();
-            let recv_count = total_received.clone();
-            let lat_sum = latency_sum.clone();
-            let lat_cnt = latency_count.clone();
-            let conn_errs = connect_errors.clone();
-            let senders = senders.clone();
+            let m = metrics.clone();
+            let pi = args.ping_interval;
 
-            batch_futures.push(tokio::spawn(async move {
-                match tokio::time::timeout(Duration::from_secs(10), connect_async(&url)).await {
-                    Ok(Ok((ws_stream, _))) => {
-                        let (mut write, read) = ws_stream.split();
+            // Assign first N devices to groups
+            let group = if device_id < total_group_devices {
+                Some((device_id % args.groups) + 1)
+            } else {
+                None
+            };
 
-                        // Subscribe to room
-                        let sub = json!({"type": "subscribe", "room": "userLocation"});
-                        let _ = write.send(Message::Text(sub.to_string())).await;
-
-                        senders.lock().await.push(write);
-
-                        // Spawn receiver task
-                        let handle = tokio::spawn(async move {
-                            let mut read = read;
-                            while let Some(Ok(msg)) = read.next().await {
-                                if let Message::Text(text) = msg {
-                                    recv_count.fetch_add(1, Ordering::Relaxed);
-                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        if let Some(sent_at) = parsed
-                                            .get("data")
-                                            .and_then(|d| d.get("sentAt"))
-                                            .and_then(|v| v.as_u64())
-                                        {
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis() as u64;
-                                            let lat = now.saturating_sub(sent_at);
-                                            lat_sum.fetch_add(lat, Ordering::Relaxed);
-                                            lat_cnt.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                        Some(handle)
-                    }
-                    _ => {
-                        conn_errs.fetch_add(1, Ordering::Relaxed);
-                        None
-                    }
-                }
+            batch_tasks.push(tokio::spawn(async move {
+                scenarios::run_device(url, device_id, group, pi, test_duration, m).await;
             }));
         }
 
-        let results = futures_util::future::join_all(batch_futures).await;
-        for r in results {
-            if let Ok(Some(handle)) = r {
-                receiver_handles.push(handle);
-            }
+        // Wait for this batch to at least start connecting
+        for task in batch_tasks {
+            device_handles.push(task);
         }
 
-        let connected = args.clients - connect_errors.load(Ordering::Relaxed) as usize;
-        eprint!(
-            "\r   {}/{} connected — errors: {}   ",
-            connected,
-            args.clients,
-            connect_errors.load(Ordering::Relaxed)
+        let connected = metrics
+            .connections_successful
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let failed = metrics
+            .connections_failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "🔗 Batch {}-{} spawned ({} connected, {} failed)",
+            batch_start, batch_end, connected, failed
         );
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(args.ramp_delay_ms)).await;
     }
 
-    let connected = args.clients - connect_errors.load(Ordering::Relaxed) as usize;
-    let connect_elapsed = connect_start.elapsed().as_secs_f64();
-    println!(
-        "\n✅ {}/{} connected in {:.1}s ({} errors)\n",
-        connected,
-        args.clients,
-        connect_elapsed,
-        connect_errors.load(Ordering::Relaxed)
-    );
-
-    let sender_count = senders.lock().await.len();
-    if sender_count == 0 {
-        eprintln!("❌ No clients connected — aborting");
-        return;
-    }
-
-    // Send phase
-    println!(
-        "🚀 Sending {} msg/s across {} clients for {}s...\n",
-        args.rate, sender_count, args.duration
-    );
-
-    let interval_us = 1_000_000 / args.rate;
-    let test_start = Instant::now();
-    let ts = total_sent.clone();
-    let se = send_errors.clone();
-    let dur = args.duration;
-
-    // Progress printer
-    let prog_sent = total_sent.clone();
-    let prog_recv = total_received.clone();
-    let prog_errs = send_errors.clone();
-    let prog_start = test_start;
+    // Progress reporter
+    let progress_metrics = metrics.clone();
     let progress_handle = tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(500));
+        let progress_start = Instant::now();
         loop {
-            interval.tick().await;
-            let elapsed = prog_start.elapsed().as_secs_f64();
-            let sent = prog_sent.load(Ordering::Relaxed);
-            let recv = prog_recv.load(Ordering::Relaxed);
-            let rate = if elapsed > 0.0 { sent as f64 / elapsed } else { 0.0 };
-            eprint!(
-                "\r📊 {:.1}s | Sent: {} | Received: {} | Rate: {:.0} msg/s | Errors: {}   ",
-                elapsed,
-                sent,
-                recv,
-                rate,
-                prog_errs.load(Ordering::Relaxed)
-            );
-            if elapsed >= dur as f64 + 3.0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let elapsed = progress_start.elapsed().as_secs_f64();
+            report::print_progress(elapsed, &progress_metrics);
+            if elapsed >= test_duration.as_secs_f64() + 5.0 {
                 break;
             }
         }
     });
 
-    // Sender loop
-    let senders_ref = senders.clone();
-    let sender_handle = tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_micros(interval_us));
-
-        loop {
-            interval.tick().await;
-            if test_start.elapsed() >= Duration::from_secs(dur) {
-                break;
-            }
-
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-
-            let user_id: usize = rand::random::<usize>() % sender_count;
-            let lat: f64 = 19.4326 + (rand::random::<f64>() * 0.1);
-            let lng: f64 = -99.1332 + (rand::random::<f64>() * 0.1);
-
-            let payload = json!({
-                "type": "userLocation",
-                "room": "userLocation",
-                "userId": format!("user-{}", user_id),
-                "sentAt": now_ms,
-                "location": {
-                    "lat": lat,
-                    "lng": lng,
-                }
-            });
-
-            let idx = rand::random::<usize>() % sender_count;
-            let mut lock = senders_ref.lock().await;
-            if let Some(writer) = lock.get_mut(idx) {
-                match writer.send(Message::Text(payload.to_string())).await {
-                    Ok(_) => {
-                        ts.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        se.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    });
-
-    sender_handle.await.unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for all tasks
+    for h in device_handles {
+        let _ = h.await;
+    }
+    for h in coach_handles {
+        let _ = h.await;
+    }
+    let _ = map_handle.await;
     progress_handle.abort();
 
-    // Results
-    let elapsed = test_start.elapsed().as_secs_f64() - 3.0;
-    let sent = total_sent.load(Ordering::Relaxed);
-    let received = total_received.load(Ordering::Relaxed);
-    let expected = sent * connected as u64;
-    let delivery = if expected > 0 {
-        (received as f64 / expected as f64) * 100.0
-    } else {
-        0.0
-    };
-    let actual_rate = sent as f64 / elapsed;
+    let actual_duration = start.elapsed().as_secs_f64();
 
-    let lat_c = latency_count.load(Ordering::Relaxed);
-    let lat_s = latency_sum.load(Ordering::Relaxed);
-    let avg_lat = if lat_c > 0 { lat_s as f64 / lat_c as f64 } else { 0.0 };
+    // Final report
+    report::print_final_report(&args.url, actual_duration, &metrics);
 
-    println!(
-        "\n\n\
-        ╔══════════════════════════════════════════════╗\n\
-        ║              Results                         ║\n\
-        ╠══════════════════════════════════════════════╣\n\
-        ║  Clients:        {:<27}║\n\
-        ║  Duration:       {:<27}║\n\
-        ║  Sent:           {:<27}║\n\
-        ║  Received:       {:<27}║\n\
-        ║  Delivery:       {:<27}║\n\
-        ║  Actual rate:    {:<27}║\n\
-        ║  Connect errs:   {:<27}║\n\
-        ║  Send errs:      {:<27}║\n\
-        ╠══════════════════════════════════════════════╣\n\
-        ║  Latency (avg):  {:<27}║\n\
-        ╚══════════════════════════════════════════════╝\n",
-        format!("{} connected", connected),
-        format!("{:.1}s", elapsed),
-        format!("{} messages", sent),
-        format!("{} / {}", received, expected),
-        format!("{:.1}%", delivery),
-        format!("{:.1} msg/s", actual_rate),
-        connect_errors.load(Ordering::Relaxed),
-        send_errors.load(Ordering::Relaxed),
-        format!("{:.1} ms", avg_lat),
-    );
-
-    if delivery >= 99.0
-        && connect_errors.load(Ordering::Relaxed) == 0
-        && send_errors.load(Ordering::Relaxed) == 0
-    {
-        println!("✅ PASS — Server handled the load successfully");
-    } else if delivery >= 95.0 {
-        println!("⚠️  WARN — Minor issues detected");
-    } else {
-        println!("❌ FAIL — Significant issues under load");
-    }
-
-    // Cleanup
-    println!("\n🧹 Closing connections...");
-    for handle in receiver_handles {
-        handle.abort();
+    // JSON output
+    if let Some(ref path) = args.json_output {
+        let config = serde_json::json!({
+            "devices": args.devices,
+            "groups": args.groups,
+            "devices_per_group": args.devices_per_group,
+            "ping_interval": args.ping_interval,
+            "duration": args.duration,
+            "batch": args.batch,
+            "coach_events_per_min": args.coach_events_per_min
+        });
+        if let Err(e) = report::write_json_report(path, &args.url, actual_duration, &config, &metrics) {
+            eprintln!("❌ Failed to write JSON report: {e}");
+        } else {
+            eprintln!("📄 JSON report written to {path}");
+        }
     }
 }
