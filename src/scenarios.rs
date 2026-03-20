@@ -108,63 +108,23 @@ pub async fn run_device(
         }
     });
 
-    // Sender loop — random positions across Mexico
-    // Lat: 14.5 (Chiapas) to 32.7 (Tijuana)
-    // Lng: -117.1 (Tijuana) to -86.7 (Cancún)
-    let base_lat: f64 = {
+    // Sender loop — random positions across all of Mexico
+    // Each device gets a random point anywhere in the country
+    // then drifts ±0.01° (~1km) per update for movement
+    // Mexico bounds: Lat 14.5-32.7, Lng -117.1 to -86.7
+    // Exclude ocean areas with simple polygon check
+    let (base_lat, base_lng) = {
         let mut rng = rand::thread_rng();
-        // Weighted toward major cities
-        let cities: &[(f64, f64)] = &[
-            (19.4326, -99.1332),   // CDMX
-            (20.6597, -103.3496),  // Guadalajara
-            (25.6866, -100.3161),  // Monterrey
-            (21.1619, -86.8515),   // Cancún
-            (20.9674, -89.5926),   // Mérida
-            (19.1738, -96.1342),   // Veracruz
-            (32.5149, -117.0382),  // Tijuana
-            (20.5888, -100.3899),  // Querétaro
-            (21.8818, -102.2916),  // Aguascalientes
-            (22.1565, -100.9855),  // San Luis Potosí
-            (28.6353, -106.0889),  // Chihuahua
-            (24.0277, -104.6532),  // Durango
-            (17.0732, -96.7266),   // Oaxaca
-            (16.7370, -93.1296),   // Tuxtla Gutiérrez
-            (19.0414, -98.2063),   // Puebla
-            (21.0190, -101.2574),  // León
-            (20.1011, -98.7591),   // Pachuca
-            (18.9242, -99.2216),   // Cuernavaca
-            (23.6345, -102.5528),  // Zacatecas
-            (31.6904, -106.4245),  // Ciudad Juárez
-        ];
-        let city = cities[device_id % cities.len()];
-        city.0 + rng.gen_range(-0.05..0.05)
-    };
-    let base_lng: f64 = {
-        let mut rng = rand::thread_rng();
-        let cities: &[(f64, f64)] = &[
-            (19.4326, -99.1332),
-            (20.6597, -103.3496),
-            (25.6866, -100.3161),
-            (21.1619, -86.8515),
-            (20.9674, -89.5926),
-            (19.1738, -96.1342),
-            (32.5149, -117.0382),
-            (20.5888, -100.3899),
-            (21.8818, -102.2916),
-            (22.1565, -100.9855),
-            (28.6353, -106.0889),
-            (24.0277, -104.6532),
-            (17.0732, -96.7266),
-            (16.7370, -93.1296),
-            (19.0414, -98.2063),
-            (21.0190, -101.2574),
-            (20.1011, -98.7591),
-            (18.9242, -99.2216),
-            (23.6345, -102.5528),
-            (31.6904, -106.4245),
-        ];
-        let city = cities[device_id % cities.len()];
-        city.1 + rng.gen_range(-0.05..0.05)
+        loop {
+            let lat = rng.gen_range(14.5..32.7);
+            let lng = rng.gen_range(-117.1..-86.7);
+            // Simple filter: skip Baja California peninsula ocean gap
+            // and Gulf of Mexico / Pacific Ocean areas
+            if lat < 23.0 && lng < -110.0 && lat < 20.0 { continue; } // Pacific south of Baja
+            if lat > 24.0 && lat < 29.0 && lng < -114.0 { continue; } // Sea of Cortez
+            if lat < 18.0 && lng > -90.0 && lng < -87.5 { continue; } // Caribbean/Gulf near Yucatan
+            break (lat, lng);
+        }
     };
 
     while Instant::now() < deadline {
@@ -173,8 +133,8 @@ pub async fn run_device(
             let jitter_ms = rng.gen_range(0..4000) as i64 - 2000;
             let interval =
                 Duration::from_millis((ping_interval as i64 * 1000 + jitter_ms).max(1000) as u64);
-            let lat = base_lat + rng.gen_range(-0.001..0.001);
-            let lng = base_lng + rng.gen_range(-0.001..0.001);
+            let lat = base_lat + rng.gen_range(-0.01..0.01);
+            let lng = base_lng + rng.gen_range(-0.01..0.01);
             (interval, lat, lng)
         };
         tokio::time::sleep(interval).await;
