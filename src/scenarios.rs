@@ -24,9 +24,8 @@ pub async fn run_device(
     };
     let (mut sink, mut stream) = (ws.sink, ws.stream);
 
-    if client::subscribe(&mut sink, "userLocation").await.is_err() {
-        return;
-    }
+    // Devices only subscribe to their group room (if any), NOT to userLocation.
+    // In production, devices send location but only the map listens.
     if let Some(g) = group {
         let room = format!("group-{g}");
         if client::subscribe(&mut sink, &room).await.is_err() {
@@ -37,7 +36,7 @@ pub async fn run_device(
     let deadline = Instant::now() + duration;
     let metrics_recv = metrics.clone();
 
-    // Receiver task
+    // Receiver task — only listens for group broadcasts (coach commands)
     let recv_handle = tokio::spawn(async move {
         while Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
