@@ -63,8 +63,8 @@ pub async fn subscribe(
     >,
     room: &str,
 ) -> Result<(), String> {
-    let msg = serde_json::json!({"type": "subscribe", "room": room});
-    sink.send(Message::Text(msg.to_string()))
+    let msg = format!("42{}", serde_json::json!(["subscribe", {"room": room}]));
+    sink.send(Message::Text(msg))
         .await
         .map_err(|e| format!("Subscribe error: {e}"))
 }

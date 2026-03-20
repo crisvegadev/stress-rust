@@ -41,15 +41,19 @@ pub async fn run_device(
         while Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
                 Ok(Some(Ok(Message::Text(txt)))) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                        let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match event_type {
-                            "openResource" | "openSession" | "openSection" | "openActivity" => {
-                                metrics_recv
-                                    .group_messages_received
-                                    .fetch_add(1, Ordering::Relaxed);
+                    // Parse Socket.IO format: 42["event", {data}]
+                    let json_str = if let Some(stripped) = txt.strip_prefix("42") { stripped } else { &txt[..] };
+                    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(arr) = arr.as_array() {
+                            let event_type = arr.first().and_then(|v| v.as_str()).unwrap_or("");
+                            match event_type {
+                                "openResource" | "openSession" | "openSection" | "openActivity" => {
+                                    metrics_recv
+                                        .group_messages_received
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -81,16 +85,24 @@ pub async fn run_device(
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        let msg = serde_json::json!({
-            "type": "userLocation",
-            "room": "userLocation",
-            "userId": format!("user-{device_id}"),
-            "location": { "lat": lat, "lng": lng },
-            "sentAt": now_ms
-        });
+        let msg = format!(
+            "42{}",
+            serde_json::json!([
+                "userLocation",
+                {
+                    "isDevice": true,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "idUserInt": device_id,
+                    "campus": format!("Campus-{}", device_id % 100),
+                    "userType": "Student",
+                    "sentAt": now_ms
+                }
+            ])
+        );
 
         match sink
-            .send(Message::Text(msg.to_string()))
+            .send(Message::Text(msg))
             .await
         {
             Ok(_) => {
@@ -114,7 +126,7 @@ pub async fn run_map_client(url: String, duration: Duration, metrics: Arc<Metric
     };
     let (mut sink, mut stream) = (ws.sink, ws.stream);
 
-    if client::subscribe(&mut sink, "userLocation").await.is_err() {
+    if client::subscribe(&mut sink, "roomMap").await.is_err() {
         return;
     }
 
@@ -127,15 +139,16 @@ pub async fn run_map_client(url: String, duration: Duration, metrics: Arc<Metric
                     .location_messages_received
                     .fetch_add(1, Ordering::Relaxed);
 
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                    let sent_at = v.get("data")
-                        .and_then(|d| d.get("sentAt"))
-                        .or_else(|| v.get("sentAt"))
-                        .and_then(|s| s.as_i64());
-                    if let Some(sent_at) = sent_at {
-                        let now = chrono::Utc::now().timestamp_millis();
-                        let latency = (now - sent_at).max(0) as u64;
-                        metrics.record_latency(latency);
+                // Parse Socket.IO format: 42["event", {data}]
+                let json_str = if let Some(stripped) = txt.strip_prefix("42") { stripped } else { &txt[..] };
+                if let Ok(arr) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(arr) = arr.as_array() {
+                        let data = arr.get(1).unwrap_or(&serde_json::Value::Null);
+                        if let Some(sent_at) = data.get("sentAt").and_then(|s| s.as_i64()) {
+                            let now = chrono::Utc::now().timestamp_millis();
+                            let latency = (now - sent_at).max(0) as u64;
+                            metrics.record_latency(latency);
+                        }
                     }
                 }
             }
@@ -183,18 +196,20 @@ pub async fn run_coach(
 
         let event_type = event_types[counter % event_types.len()];
         let resource_id = format!("res-{group_id}-{counter}");
-        let msg = serde_json::json!({
-            "type": event_type,
-            "room": room,
-            "resourceId": resource_id,
-            "data": {
-                "type": event_type,
-                "resourceId": resource_id
-            }
-        });
+        let msg = format!(
+            "42{}",
+            serde_json::json!([
+                event_type,
+                {
+                    "room": room,
+                    "resourceId": resource_id,
+                    "type": event_type
+                }
+            ])
+        );
 
         match sink
-            .send(Message::Text(msg.to_string()))
+            .send(Message::Text(msg))
             .await
         {
             Ok(_) => {
