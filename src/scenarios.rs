@@ -40,26 +40,23 @@ pub async fn run_device(
     // Receiver task
     let recv_handle = tokio::spawn(async move {
         while Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_secs(1), stream.next()).await {
+            match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
                 Ok(Some(Ok(Message::Text(txt)))) => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                        if v.get("type").and_then(|t| t.as_str()) == Some("openResource")
-                            || v.get("type").and_then(|t| t.as_str()) == Some("openSession")
-                            || v.get("type").and_then(|t| t.as_str()) == Some("openSection")
-                            || v.get("type").and_then(|t| t.as_str()) == Some("openActivity")
-                        {
-                            metrics_recv
-                                .group_messages_received
-                                .fetch_add(1, Ordering::Relaxed);
+                        let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match event_type {
+                            "openResource" | "openSession" | "openSection" | "openActivity" => {
+                                metrics_recv
+                                    .group_messages_received
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => {}
                         }
                     }
                 }
-                Ok(Some(Ok(Message::Ping(data)))) => {
-                    // Pong is handled automatically by tungstenite
-                    let _ = data;
-                }
+                Ok(Some(Ok(Message::Ping(_)))) => {}
                 Ok(Some(Err(_))) | Ok(None) => break,
-                _ => {}
+                _ => {} // timeout, continue
             }
         }
     });
@@ -125,14 +122,18 @@ pub async fn run_map_client(url: String, duration: Duration, metrics: Arc<Metric
     let deadline = Instant::now() + duration;
 
     while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(1), stream.next()).await {
+        match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
             Ok(Some(Ok(Message::Text(txt)))) => {
                 metrics
                     .location_messages_received
                     .fetch_add(1, Ordering::Relaxed);
 
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                    if let Some(sent_at) = v.get("sentAt").and_then(|s| s.as_i64()) {
+                    let sent_at = v.get("data")
+                        .and_then(|d| d.get("sentAt"))
+                        .or_else(|| v.get("sentAt"))
+                        .and_then(|s| s.as_i64());
+                    if let Some(sent_at) = sent_at {
                         let now = chrono::Utc::now().timestamp_millis();
                         let latency = (now - sent_at).max(0) as u64;
                         metrics.record_latency(latency);
