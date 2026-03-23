@@ -1,4 +1,5 @@
 mod client;
+mod histogram;
 mod metrics;
 mod mexico;
 mod report;
@@ -50,6 +51,10 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     coach_events_per_min: u64,
 
+    /// Number of map clients (receivers measuring latency)
+    #[arg(short = 'm', long, default_value_t = 3)]
+    map_clients: usize,
+
     /// Output JSON report to file
     #[arg(long)]
     json_output: Option<String>,
@@ -66,18 +71,21 @@ async fn main() {
 
     eprintln!("🚀 Knotion WebSocket Stress Test");
     eprintln!("   Server: {}", args.url);
-    eprintln!("   Devices: {}, Groups: {}, Devices/group: {}", args.devices, args.groups, args.devices_per_group);
+    eprintln!("   Devices: {}, Groups: {}, Devices/group: {}, Map clients: {}", args.devices, args.groups, args.devices_per_group, args.map_clients);
     eprintln!("   Duration: {}s, Ping interval: {}s", args.duration, args.ping_interval);
     eprintln!();
 
     let start = Instant::now();
 
-    // Spawn map client first
-    let map_url = args.url.clone();
-    let map_metrics = metrics.clone();
-    let map_handle = tokio::spawn(async move {
-        scenarios::run_map_client(map_url, test_duration, map_metrics).await;
-    });
+    // Spawn map clients (multiple receivers for better latency sampling)
+    let mut map_handles = Vec::new();
+    for _ in 0..args.map_clients {
+        let map_url = args.url.clone();
+        let map_metrics = metrics.clone();
+        map_handles.push(tokio::spawn(async move {
+            scenarios::run_map_client(map_url, test_duration, map_metrics).await;
+        }));
+    }
 
     // Small delay to let map client connect first
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -135,13 +143,29 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(args.ramp_delay_ms)).await;
     }
 
-    // Progress reporter
+    // Progress reporter + time-series capture
     let progress_metrics = metrics.clone();
     let progress_handle = tokio::spawn(async move {
         let progress_start = Instant::now();
+        let mut prev_sent = 0u64;
+        let mut prev_map_recv = 0u64;
+        let mut sec = 0u64;
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+            sec += 1;
             let elapsed = progress_start.elapsed().as_secs_f64();
+
+            let cur_sent = progress_metrics
+                .messages_sent
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let cur_map_recv = progress_metrics
+                .location_messages_received
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            progress_metrics.capture_snapshot(sec, prev_sent, prev_map_recv);
+            prev_sent = cur_sent;
+            prev_map_recv = cur_map_recv;
+
             report::print_progress(elapsed, &progress_metrics);
             if elapsed >= test_duration.as_secs_f64() + 5.0 {
                 break;
@@ -156,7 +180,9 @@ async fn main() {
     for h in coach_handles {
         let _ = h.await;
     }
-    let _ = map_handle.await;
+    for h in map_handles {
+        let _ = h.await;
+    }
     progress_handle.abort();
 
     let actual_duration = start.elapsed().as_secs_f64();
