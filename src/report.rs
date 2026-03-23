@@ -22,6 +22,8 @@ pub fn print_final_report(
     url: &str,
     duration_secs: f64,
     metrics: &Arc<Metrics>,
+    map_clients: usize,
+    ramp_up_secs: u64,
 ) {
     let conns_total = metrics.connections_attempted.load(Ordering::Relaxed);
     let conns_ok = metrics.connections_successful.load(Ordering::Relaxed);
@@ -45,8 +47,9 @@ pub fn print_final_report(
         0.0
     };
 
-    let delivery_pct = if sent > 0 {
-        map_recv as f64 / sent as f64 * 100.0
+    let delivery_pct = if sent > 0 && map_clients > 0 {
+        let expected = sent * map_clients as u64;
+        map_recv as f64 / expected as f64 * 100.0
     } else {
         0.0
     };
@@ -81,7 +84,7 @@ pub fn print_final_report(
 
     // Time-series degradation analysis
     let time_series = metrics.time_series.lock().unwrap();
-    let stability = analyze_stability(&time_series);
+    let stability = analyze_stability(&time_series, ramp_up_secs);
 
     println!(
         r#"
@@ -147,13 +150,15 @@ pub fn print_final_report(
     );
 }
 
-fn analyze_stability(snapshots: &[crate::metrics::Snapshot]) -> String {
-    if snapshots.len() < 3 {
+fn analyze_stability(snapshots: &[crate::metrics::Snapshot], ramp_up_secs: u64) -> String {
+    let skip = (ramp_up_secs as usize).max(3);
+
+    if snapshots.len() <= skip {
         return "║    Not enough data points for analysis           ║\n".to_string();
     }
 
-    // Skip first 2 seconds (ramp-up)
-    let stable: Vec<_> = snapshots.iter().skip(2).collect();
+    // Skip ramp-up period
+    let stable: Vec<_> = snapshots.iter().skip(skip).collect();
     if stable.is_empty() {
         return "║    Not enough data after ramp-up                 ║\n".to_string();
     }
@@ -212,6 +217,8 @@ pub fn write_json_report(
     duration_secs: f64,
     config: &serde_json::Value,
     metrics: &Arc<Metrics>,
+    map_clients: usize,
+    ramp_up_secs: u64,
 ) -> std::io::Result<()> {
     let conns_total = metrics.connections_attempted.load(Ordering::Relaxed);
     let conns_ok = metrics.connections_successful.load(Ordering::Relaxed);
@@ -223,8 +230,9 @@ pub fn write_json_report(
     let ct = metrics.conn_time.percentiles();
     let lat = metrics.latency.percentiles();
 
-    let delivery_pct = if sent > 0 {
-        map_recv as f64 / sent as f64 * 100.0
+    let delivery_pct = if sent > 0 && map_clients > 0 {
+        let expected = sent * map_clients as u64;
+        map_recv as f64 / expected as f64 * 100.0
     } else {
         0.0
     };
@@ -283,6 +291,7 @@ pub fn write_json_report(
             "inbound_per_sec": inbound as u64,
             "outbound_per_sec": outbound as u64
         },
+        "ramp_up_secs": ramp_up_secs,
         "time_series": *time_series
     });
 

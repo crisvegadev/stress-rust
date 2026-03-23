@@ -188,7 +188,8 @@ async fn main() {
     let actual_duration = start.elapsed().as_secs_f64();
 
     // Final report
-    report::print_final_report(&args.url, actual_duration, &metrics);
+    let ramp_up_secs = ((args.devices as f64 / args.batch as f64) * args.ramp_delay_ms as f64 / 1000.0).ceil() as u64 + 2;
+    report::print_final_report(&args.url, actual_duration, &metrics, args.map_clients, ramp_up_secs);
 
     // JSON output
     if let Some(ref path) = args.json_output {
@@ -199,9 +200,10 @@ async fn main() {
             "ping_interval": args.ping_interval,
             "duration": args.duration,
             "batch": args.batch,
-            "coach_events_per_min": args.coach_events_per_min
+            "coach_events_per_min": args.coach_events_per_min,
+            "map_clients": args.map_clients
         });
-        if let Err(e) = report::write_json_report(path, &args.url, actual_duration, &config, &metrics) {
+        if let Err(e) = report::write_json_report(path, &args.url, actual_duration, &config, &metrics, args.map_clients, ramp_up_secs) {
             eprintln!("❌ Failed to write JSON report: {e}");
         } else {
             eprintln!("📄 JSON report written to {path}");
