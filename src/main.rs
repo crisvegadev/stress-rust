@@ -1,5 +1,6 @@
 mod client;
 mod metrics;
+mod mexico;
 mod report;
 mod scenarios;
 

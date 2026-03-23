@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::client;
 use crate::metrics::Metrics;
+use crate::mexico::MUNICIPALITIES;
 
 const CAMPUSES: &[&str] = &[
     "Colegio Colón de Ocotlán",
@@ -108,23 +109,11 @@ pub async fn run_device(
         }
     });
 
-    // Sender loop — random positions across all of Mexico
-    // Each device gets a random point anywhere in the country
-    // then drifts ±0.01° (~1km) per update for movement
-    // Mexico bounds: Lat 14.5-32.7, Lng -117.1 to -86.7
-    // Exclude ocean areas with simple polygon check
+    // Pick a random municipality as base location
     let (base_lat, base_lng) = {
         let mut rng = rand::thread_rng();
-        loop {
-            let lat = rng.gen_range(14.5..32.7);
-            let lng = rng.gen_range(-117.1..-86.7);
-            // Simple filter: skip Baja California peninsula ocean gap
-            // and Gulf of Mexico / Pacific Ocean areas
-            if lat < 23.0 && lng < -110.0 && lat < 20.0 { continue; } // Pacific south of Baja
-            if lat > 24.0 && lat < 29.0 && lng < -114.0 { continue; } // Sea of Cortez
-            if lat < 18.0 && lng > -90.0 && lng < -87.5 { continue; } // Caribbean/Gulf near Yucatan
-            break (lat, lng);
-        }
+        let muni = &MUNICIPALITIES[rng.gen_range(0..MUNICIPALITIES.len())];
+        (muni.lat, muni.lng)
     };
 
     while Instant::now() < deadline {
