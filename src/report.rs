@@ -157,8 +157,12 @@ fn analyze_stability(snapshots: &[crate::metrics::Snapshot], ramp_up_secs: u64) 
         return "║    Not enough data points for analysis           ║\n".to_string();
     }
 
-    // Skip ramp-up period
-    let stable: Vec<_> = snapshots.iter().skip(skip).collect();
+    // Skip ramp-up period AND last 3 seconds (wind-down)
+    let wind_down = 3;
+    if snapshots.len() <= skip + wind_down {
+        return "║    Not enough data points for analysis           ║\n".to_string();
+    }
+    let stable: Vec<_> = snapshots.iter().skip(skip).take(snapshots.len() - skip - wind_down).collect();
     if stable.is_empty() {
         return "║    Not enough data after ramp-up                 ║\n".to_string();
     }
@@ -177,7 +181,15 @@ fn analyze_stability(snapshots: &[crate::metrics::Snapshot], ramp_up_secs: u64) 
     };
 
     let degraded = p99_last > p99_first * 3 && p99_last > 100;
-    let rate_dropped = rate_values.last().copied().unwrap_or(0) < rate_avg / 2 && rate_avg > 0;
+
+    // Compare last 10% of send rates vs average (more robust than single last value)
+    let tail_len = (rate_values.len() / 10).max(3).min(rate_values.len());
+    let tail_avg = if tail_len > 0 {
+        rate_values[rate_values.len() - tail_len..].iter().sum::<u64>() / tail_len as u64
+    } else {
+        0
+    };
+    let rate_dropped = tail_avg < rate_avg / 2 && rate_avg > 0;
 
     let mut lines = String::new();
 
